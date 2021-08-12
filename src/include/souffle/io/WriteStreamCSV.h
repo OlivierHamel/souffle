@@ -237,9 +237,9 @@ protected:
 
 class WriteCoutPrintSize : public WriteStream {
 public:
-    explicit WriteCoutPrintSize(const std::map<std::string, std::string>& rwOperation)
-            : WriteStream(rwOperation, *static_cast<SymbolTable*>(0), *static_cast<RecordTable*>(0)),
-              lease(souffle::getOutputLock().acquire()) {
+    explicit WriteCoutPrintSize(const std::map<std::string, std::string>& rwOperation, const SymbolTable& sym,
+            const RecordTable& rec)
+            : WriteStream(rwOperation, sym, rec), lease(souffle::getOutputLock().acquire()) {
         std::cout << rwOperation.at("name") << "\t";
     }
 
@@ -295,9 +295,9 @@ public:
 
 class WriteCoutPrintSizeFactory : public WriteStreamFactory {
 public:
-    Own<WriteStream> getWriter(const std::map<std::string, std::string>& rwOperation, const SymbolTable&,
-            const RecordTable&) override {
-        return mk<WriteCoutPrintSize>(rwOperation);
+    Own<WriteStream> getWriter(const std::map<std::string, std::string>& rwOperation, const SymbolTable& sym,
+            const RecordTable& rec) override {
+        return mk<WriteCoutPrintSize>(rwOperation, sym, rec);
     }
     const std::string& getName() const override {
         static const std::string name = "stdoutprintsize";
