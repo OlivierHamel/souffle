@@ -186,9 +186,7 @@ struct ReadWriteLockBase {
 }  // namespace detail
 
 struct SeqConcurrentLanes {
-    struct TrivialLock {
-        ~TrivialLock() {}
-    };
+    struct TrivialLock {};
 
     using lane_id = std::size_t;
     using unique_lock_type = TrivialLock;
@@ -196,8 +194,6 @@ struct SeqConcurrentLanes {
     explicit SeqConcurrentLanes(std::size_t = 1) {}
     SeqConcurrentLanes(const SeqConcurrentLanes&) = delete;
     SeqConcurrentLanes(SeqConcurrentLanes&&) = delete;
-
-    virtual ~SeqConcurrentLanes() {}
 
     std::size_t lanes() const {
         return 1;
@@ -594,25 +590,21 @@ struct MutexConcurrentLanes {
     using lane_id = std::size_t;
     using unique_lock_type = std::unique_lock<std::mutex>;
 
-    explicit MutexConcurrentLanes(const std::size_t Sz) : Size(Sz), Attribution(attribution(Sz)) {
-        Lanes = std::make_unique<Lane[]>(Sz);
-    }
+    explicit MutexConcurrentLanes(const std::size_t Sz) : Attribution(attribution(Sz)), Lanes(Sz) {}
     MutexConcurrentLanes(const MutexConcurrentLanes&) = delete;
     MutexConcurrentLanes(MutexConcurrentLanes&&) = delete;
 
-    virtual ~MutexConcurrentLanes() {}
-
     // Return the number of lanes.
     std::size_t lanes() const {
-        return Size;
+        return Lanes.size();
     }
 
     // Select a lane
     lane_id getLane(std::size_t I) const {
         if (Attribution == lane_attribution::mod_power_of_2) {
-            return I & (Size - 1);
+            return I & (lanes() - 1);
         } else {
-            return I % Size;
+            return I % lanes();
         }
     }
 
@@ -620,26 +612,25 @@ struct MutexConcurrentLanes {
      * DO not use while threads are using this object.
      */
     void setNumLanes(const std::size_t NumLanes) {
-        Size = (NumLanes == 0 ? 1 : NumLanes);
-        Attribution = attribution(Size);
-        Lanes = std::make_unique<Lane[]>(Size);
+        Lanes = std::vector<Lane>(NumLanes == 0 ? 1 : NumLanes);
+        Attribution = attribution(Lanes.size());
     }
 
     unique_lock_type guard(const lane_id Lane) const {
+        assert(Lane < lanes());
         return unique_lock_type(Lanes[Lane].Access);
     }
 
     // Lock the given track.
     // Must eventually be followed by unlock(Lane).
     void lock(const lane_id Lane) const {
-        assert(Lane < Size);
-        Lanes[Lane].Access.lock();
+        assert(Lane < lanes());
     }
 
     // Unlock the given track.
     // Must already be the owner of the track's lock.
     void unlock(const lane_id Lane) const {
-        assert(Lane < Size);
+        assert(Lane < lanes());
         Lanes[Lane].Access.unlock();
     }
 
@@ -673,7 +664,7 @@ struct MutexConcurrentLanes {
     //
     // Must eventually be followed by unlockAllBut(Lane).
     void lockAllBut(const lane_id Lane) const {
-        for (std::size_t I = 0; I < Size; ++I) {
+        for (std::size_t I = 0; I < lanes(); ++I) {
             if (I != Lane) {
                 Lanes[I].Access.lock();
             }
@@ -683,7 +674,7 @@ struct MutexConcurrentLanes {
     // Unlock all tracks but the given one.
     // Must already be the owner of all the tracks' locks.
     void unlockAllBut(const lane_id Lane) const {
-        for (std::size_t I = 0; I < Size; ++I) {
+        for (std::size_t I = 0; I < lanes(); ++I) {
             if (I != Lane) {
                 Lanes[I].Access.unlock();
             }
@@ -707,17 +698,14 @@ private:
         }
     }
 
-protected:
-    std::size_t Size;
     lane_attribution Attribution;
 
-private:
-    mutable std::unique_ptr<Lane[]> Lanes;
+    mutable std::vector<Lane> Lanes;
 
     alignas(hardware_destructive_interference_size) mutable std::mutex BeforeLockAll;
 };
 
-class ConcurrentLanes : public MutexConcurrentLanes {
+class ConcurrentLanes final : public MutexConcurrentLanes {
     using Base = MutexConcurrentLanes;
 
 public:
@@ -872,7 +860,7 @@ public:
     }
 };
 
-struct ConcurrentLanes : protected SeqConcurrentLanes {
+struct ConcurrentLanes final : protected SeqConcurrentLanes {
     using Base = SeqConcurrentLanes;
     using lane_id = SeqConcurrentLanes::lane_id;
     using unique_lock_type = SeqConcurrentLanes::unique_lock_type;
@@ -883,8 +871,6 @@ struct ConcurrentLanes : protected SeqConcurrentLanes {
     explicit ConcurrentLanes(std::size_t Sz = MAX_THREADS) : Base(Sz) {}
     ConcurrentLanes(const ConcurrentLanes&) = delete;
     ConcurrentLanes(ConcurrentLanes&&) = delete;
-
-    virtual ~ConcurrentLanes() {}
 
     lane_id threadLane() const {
         return 0;
