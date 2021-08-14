@@ -9,8 +9,10 @@
 
 #include "ConcurrentInsertOnlyHashMap.h"
 #include "souffle/utility/ParallelUtil.h"
+#include <atomic>
 #include <cassert>
 #include <cstring>
+#include <limits>
 
 namespace souffle {
 
@@ -61,7 +63,7 @@ public:
         slot_type NextMaybeUnassignedSlot;
 
         /// Handle that owns the next slot that might be unassigned.
-        int64_t NextMaybeUnassignedHandle;
+        slot_type NextMaybeUnassignedHandle = None;
 
         static constexpr int64_t End = std::numeric_limits<slot_type>::max();
         static constexpr int64_t None = -1;
@@ -79,51 +81,26 @@ public:
         }
 
     public:
+        Iterator() = delete;
+        Iterator(const Iterator&) = default;
+        Iterator(Iterator&&) = default;
+
         // The 'begin' iterator
         Iterator(const ConcurrentFlyweight* This, const lane_id H)
-                : This(This), Lane(H), Slot(None), NextMaybeUnassignedSlot(0),
-                  NextMaybeUnassignedHandle(None) {
+                : This(This), Lane(H), Slot(None), NextMaybeUnassignedSlot(0) {
             FindNextMaybeUnassignedSlot();
             MoveToNextAssignedSlot();
         }
 
         // The 'end' iterator
         Iterator(const ConcurrentFlyweight* This)
-                : This(This), Lane(0), Slot(End), NextMaybeUnassignedSlot(End),
-                  NextMaybeUnassignedHandle(None) {}
+                : This(This), Lane(0), Slot(End), NextMaybeUnassignedSlot(End) {}
 
         // The iterator starting at slot I, using access lane H.
         Iterator(const ConcurrentFlyweight* This, const lane_id H, const index_type I)
-                : This(This), Lane(H), Slot(slot(I)), NextMaybeUnassignedSlot(slot(I)),
-                  NextMaybeUnassignedHandle(None) {
+                : This(This), Lane(H), Slot(slot(I)), NextMaybeUnassignedSlot(slot(I)) {
             FindNextMaybeUnassignedSlot();
             MoveToNextAssignedSlot();
-        }
-
-        Iterator(const Iterator& That)
-                : This(That.This), Lane(That.Lane), Slot(That.Slot),
-                  NextMaybeUnassignedSlot(That.NextMaybeUnassignedSlot),
-                  NextMaybeUnassignedHandle(That.NextMaybeUnassignedHandle) {}
-
-        Iterator(Iterator&& That)
-                : This(That.This), Lane(That.Lane), Slot(That.Slot),
-                  NextMaybeUnassignedSlot(That.NextMaybeUnassignedSlot),
-                  NextMaybeUnassignedHandle(That.NextMaybeUnassignedHandle) {}
-
-        Iterator& operator=(const Iterator& That) {
-            This = That.This;
-            Lane = That.Lane;
-            Slot = That.Slot;
-            NextMaybeUnassignedSlot = That.NextMaybeUnassignedSlot;
-            NextMaybeUnassignedHandle = That.NextMaybeUnassignedHandle;
-        }
-
-        Iterator& operator=(Iterator&& That) {
-            This = That.This;
-            Lane = That.Lane;
-            Slot = That.Slot;
-            NextMaybeUnassignedSlot = That.NextMaybeUnassignedSlot;
-            NextMaybeUnassignedHandle = That.NextMaybeUnassignedHandle;
         }
 
         reference operator*() const {
@@ -210,34 +187,14 @@ public:
     using iterator = Iterator;
 
     /// Initialize the datastructure with the given capacity.
-    ConcurrentFlyweight(const std::size_t LaneCount, const std::size_t InitialCapacity,
-            const bool ReserveFirst, const Hash& hash = Hash(), const KeyEqual& key_equal = KeyEqual(),
-            const KeyFactory& key_factory = KeyFactory())
-            : Lanes(LaneCount), HandleCount(LaneCount),
-              Mapping(LaneCount, InitialCapacity, hash, key_equal, key_factory) {
+    ConcurrentFlyweight(std::size_t LaneCount, std::size_t InitialCapacity = 8, bool ReserveFirst = false,
+            Hash hash = {}, KeyEqual key_equal = {}, KeyFactory key_factory = {})
+            : Lanes(LaneCount), Mapping(LaneCount, InitialCapacity, std::move(hash), std::move(key_equal),
+                                        std::move(key_factory)) {
         Slots = std::make_unique<const value_type*[]>(InitialCapacity);
         Handles = std::make_unique<Handle[]>(HandleCount);
         NextSlot = (ReserveFirst ? 1 : 0);
         MaxSlotBeforeGrow = InitialCapacity - 1;
-    }
-
-    /// Initialize the datastructure with a capacity of 8 elements.
-    ConcurrentFlyweight(const std::size_t LaneCount, const bool ReserveFirst, const Hash& hash = Hash(),
-            const KeyEqual& key_equal = KeyEqual(), const KeyFactory& key_factory = KeyFactory())
-
-            : ConcurrentFlyweight(LaneCount, 8, ReserveFirst, hash, key_equal, key_factory) {}
-
-    /// Initialize the datastructure with a capacity of 8 elements.
-    ConcurrentFlyweight(const std::size_t LaneCount, const Hash& hash = Hash(),
-            const KeyEqual& key_equal = KeyEqual(), const KeyFactory& key_factory = KeyFactory())
-            : ConcurrentFlyweight(LaneCount, 8, false, hash, key_equal, key_factory) {}
-
-    virtual ~ConcurrentFlyweight() {
-        for (lane_id I = 0; I < HandleCount; ++I) {
-            if (Handles[I].NextNode) {
-                delete Handles[I].NextNode;
-            }
-        }
     }
 
     /**
@@ -322,6 +279,8 @@ private:
     using map_type = ConcurrentInsertOnlyHashMap<LanesPolicy, Key, index_type, Hash, KeyEqual, KeyFactory>;
     using node_type = typename map_type::node_type;
 
+    // Caches nodes for insertion. If an insertion fails (i.e. already present),
+    // the allocation is kept for the insertion attempt.
     struct Handle {
         /// Slot where this handle will store its next value
         int64_t NextSlot = -1;
@@ -389,12 +348,7 @@ public:
     using lane_id = typename Base::lane_id;
     using iterator = typename Base::iterator;
 
-    explicit OmpFlyweight(const std::size_t LaneCount, const std::size_t InitialCapacity = 8,
-            const bool ReserveFirst = false, const Hash& hash = Hash(),
-            const KeyEqual& key_equal = KeyEqual(), const KeyFactory& key_factory = KeyFactory())
-            : Base(LaneCount, InitialCapacity, ReserveFirst, hash, key_equal, key_factory) {}
-
-    ~OmpFlyweight() {}
+    using Base::Base;
 
     iterator begin() const {
         return Base::begin(Base::Lanes.threadLane());
@@ -434,12 +388,7 @@ public:
     using lane_id = typename Base::lane_id;
     using iterator = typename Base::iterator;
 
-    explicit SeqFlyweight(const std::size_t NumLanes, const std::size_t InitialCapacity = 8,
-            const bool ReserveFirst = false, const Hash& hash = Hash(),
-            const KeyEqual& key_equal = KeyEqual(), const KeyFactory& key_factory = KeyFactory())
-            : Base(NumLanes, InitialCapacity, ReserveFirst, hash, key_equal, key_factory) {}
-
-    ~SeqFlyweight() {}
+    using Base::Base;
 
     iterator begin() const {
         return Base::begin(0);
