@@ -135,10 +135,9 @@ public:
      *
      * Load-factor is initialized to 1.0.
      */
-    ConcurrentInsertOnlyHashMap(const std::size_t LaneCount, const std::size_t Bucket_Count, Hash hash = {},
+    ConcurrentInsertOnlyHashMap(const std::size_t /*LaneCount*/, std::size_t Bucket_Count, Hash hash = {},
             KeyEqual key_equal = {}, KeyFactory key_factory = {})
-            : Lanes(LaneCount), Hasher(std::move(hash)), EqualTo(std::move(key_equal)),
-              Factory(std::move(key_factory)) {
+            : Hasher(std::move(hash)), EqualTo(std::move(key_equal)), Factory(std::move(key_factory)) {
         Size = 0;
         LoadFactor = 1.0;  //< TODO: has this been tune?
         Buckets = BucketVector(primeBucketSizing(Bucket_Count));
@@ -155,8 +154,8 @@ public:
         });
     }
 
-    void setNumLanes(const std::size_t NumLanes) {
-        Lanes.setNumLanes(NumLanes);
+    void setNumLanes(std::size_t) {
+        /* ignore. we're not using lanes for now, but the internal impl might change in the future */
     }
 
     /** @brief Create a fresh node initialized with the given value and a
@@ -176,9 +175,9 @@ public:
      * element when the search began.
      */
     template <class K>
-    bool weakContains(const lane_id H, const K& X) const {
+    bool weakContains(const lane_id, const K& X) const {
         const size_t HashValue = Hasher(X);
-        const auto Guard = Lanes.guard(H);
+        const auto Guard = RW_Bucket.read_lock();
         const size_t Bucket = HashValue % Buckets.size();
 
         BucketList* L = Buckets[Bucket].load(std::memory_order_consume);
@@ -230,7 +229,7 @@ public:
      *
      */
     template <class... Args>
-    std::pair<const value_type*, bool> get(const lane_id H, node_type& Node, Args&&... Xs) {
+    std::pair<const value_type*, bool> get(const lane_id, node_type& Node, Args&&... Xs) {
         assert(Node && "invalid handle");
         assert(!Node->Next && "node is already part of a chain");
 
@@ -280,16 +279,11 @@ public:
         //
         // The datastructure is optionaly grown after step 9) before returning.
 
-        const value_type* Value = nullptr;
-        bool Inserted = false;
-
-        size_t NewSize;
-
         // 1)
         const size_t HashValue = Hasher(std::forward<Args>(Xs)...);
 
-        // 2)
-        Lanes.lock(H);  // prevent the datastructure from growing
+        // 2) prevent the datastructure from growing. this can cause us to temporarily exceed our load factor
+        auto read_lock = RW_Bucket.read_lock();
 
         // 3)
         const size_t Bucket = HashValue % Buckets.size();
@@ -302,7 +296,7 @@ public:
 
         // Loop until either the node is inserted or the key is found in the bucket.
         // Assuming bucket collisions are rare this loop is not executed more than once.
-        while (true) {
+        do {
             // 5)
             // search the key in the bucket, stop where we already search at a
             // previous iteration.
@@ -311,8 +305,8 @@ public:
                 if (EqualTo(L->Value.first, std::forward<Args>(Xs)...)) {
                     // 6)
                     // found the key
-                    Value = &(L->Value);
-                    goto Done;
+                    Node->Next = nullptr;  // drop any refs to the chain that may have been collected
+                    return {&L->Value, false};
                 }
                 L = L->Next;
             }
@@ -329,43 +323,27 @@ public:
             // Try to insert the key in front of the bucket's list.
             // This operation also performs step 4) because LastKnownHead is
             // updated in the process.
-            if (Buckets[Bucket].compare_exchange_strong(
-                        LastKnownHead, Node.get(), std::memory_order_release, std::memory_order_relaxed)) {
-                // 9)
-                Inserted = true;
-                NewSize = ++Size;
-                Value = &(Node->Value);
-                Node.release();
-                goto AfterInserted;
-            }
+            //
+            // 19) Exchange failed? Concurrent insertion detected in this bucket, new round required.
+        } while (!Buckets[Bucket].compare_exchange_strong(
+                LastKnownHead, Node.get(), std::memory_order_release, std::memory_order_relaxed));
 
-            // 10) concurrent insertion detected in this bucket, new round required.
-        }
+        // 9) inserted, now to see if we need to resize to satisfy our load-factor
+        auto NewSize = ++Size;
+        auto Value = &(Node->Value);
+        Node.release();
 
-    AfterInserted : {
         if (NewSize > MaxSizeBeforeGrow) {
-            tryGrow(H);
-        }
-    }
-
-    Done:
-
-        // do the assert before releasing the lock to avoid debugger/thread races
-        assert(Inserted == !Node);
-
-        Lanes.unlock(H);
-
-        if (!Inserted) {
-            Node->Next = nullptr;  // drop any refs to the chain that may have been collected
+            read_lock = {};  // release our read lock early to avoid deadlock
+            grow();
         }
 
-        // 6,9)
-        return std::make_pair(Value, Inserted);
+        return {Value, true};
     }
 
 private:
     // The concurrent lanes manager.
-    LanesPolicy<void> Lanes;
+    mutable ReadWriteLock RW_Bucket;
 
     /// Hash function.
     Hash Hasher;
@@ -388,43 +366,34 @@ private:
     double LoadFactor;
 
     // Grow the datastructure.
-    // Must be called while owning lane H.
-    bool tryGrow(const lane_id H) {
-        Lanes.beforeLockAllBut(H);
+    // Must be called while owning the write lock
+    void grow() {
+        auto _ = RW_Bucket.write_lock();
+        assert(MaxSizeBeforeGrow <= Size);
 
-        if (Size <= MaxSizeBeforeGrow) {
-            // Current size is fine
-            Lanes.beforeUnlockAllBut(H);
-            return false;
-        }
+        // Compute the new number of buckets:
+        // Chose a prime number of buckets that ensures the desired load factor
+        // given the current number of elements in the map.
+        const std::size_t CurrentSize = Size;
+        const std::size_t NeededBucketCount = std::ceil(CurrentSize / LoadFactor);
+        const std::size_t NewBucketCount = primeBucketSizing(NeededBucketCount);
 
-        Lanes.lockAllBut(H);
+        // Rehash, this operation is costly because it requires to scan
+        // the existing elements, compute its hash to find its new bucket
+        // and insert in the new bucket.
+        //
+        // Maybe concurrent lanes could help using some job-stealing algorithm.
+        BucketVector NewBuckets(NewBucketCount);
+        foreachEntry([&](BucketList* const E) {
+            auto&& [K, _] = E->Value;
+            auto& Bucket = NewBuckets[Hasher(K) % NewBuckets.size()];
 
-        {  // safe section
+            E->Next = Bucket.load(std::memory_order_relaxed);
+            Bucket.store(E, std::memory_order_relaxed);
+        });
 
-            // Compute the new number of buckets:
-            // Chose a prime number of buckets that ensures the desired load factor
-            // given the current number of elements in the map.
-            const std::size_t CurrentSize = Size;
-            const std::size_t NeededBucketCount = std::ceil(CurrentSize / LoadFactor);
-            const std::size_t NewBucketCount = primeBucketSizing(NeededBucketCount);
-
-            // Rehash, this operation is costly because it requires to scan
-            // the existing elements, compute its hash to find its new bucket
-            // and insert in the new bucket.
-            //
-            // Maybe concurrent lanes could help using some job-stealing algorithm.
-            BucketVector NewBuckets(NewBucketCount);
-            foreachEntry([&](BucketList* const E) {
-                auto&& [K, _] = E->Value;
-                auto& Bucket = NewBuckets[Hasher(K) % NewBuckets.size()];
-
-                E->Next = Bucket.load(std::memory_order_relaxed);
-                Bucket.store(E, std::memory_order_relaxed);
-            });
-
-            Buckets = std::move(NewBuckets);
-            MaxSizeBeforeGrow = std::ceil(Buckets.size() * LoadFactor);
+        Buckets = std::move(NewBuckets);
+        MaxSizeBeforeGrow = std::ceil(Buckets.size() * LoadFactor);
     }
 };
 

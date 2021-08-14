@@ -243,7 +243,7 @@ public:
     /// Return the value associated with the given index.
     /// Assumption: the index is mapped in the datastructure.
     const Key& fetch(const lane_id H, const index_type Idx) const {
-        const auto Lane = Lanes.guard(H);
+        auto _ = RW_Slots.read_lock();
         return Slots[Idx]->first;
     }
 
@@ -262,10 +262,7 @@ public:
             Slot = NextSlot++;
             Node = Mapping.node(index(Slot));
 
-            if (Slots.size() <= Slot) {
-                tryGrow(H);
-            }
-
+            auto read_lock = ensureSized(Slot);
             // insert key in the index in advance
             Slots[Slot] = &Node->Value;
         }
@@ -294,9 +291,12 @@ private:
 
 protected:
     // The concurrency manager.
+    // TODO: This sucks. Replace w/ guaranteed 1-to-1 lane-to-thread mapping. No more locks on happy path.
     LanesPolicy<Handle> Lanes;
 
 private:
+    mutable ReadWriteLock RW_Slots;
+
     // Slots[I] points to the value associated with index I.
     // TODO: Is thread contention an issue?
     std::vector<value_type const*> Slots;
@@ -307,28 +307,19 @@ private:
     // Next available slot.
     std::atomic<slot_type> NextSlot;
 
-    bool tryGrow(const lane_id H) {
-        Lanes.beforeLockAllBut(H);
-
-        if (NextSlot < Slots.size()) {
-            // Current size is fine
-            Lanes.beforeUnlockAllBut(H);
-            return false;
+    ReadWriteLock::ReadLock ensureSized(slot_type slot) {
+        {
+            auto lock = RW_Slots.read_lock();
+            if (slot < Slots.size()) return lock;
         }
 
-        Lanes.lockAllBut(H);
-
-        {  // safe section
-            const std::size_t CurrentSize = Slots.size();
-            const std::size_t NewSize = (CurrentSize << 1);  // double size policy
-            assert(NewSize <= SLOT_MAX && "sancheck - domain overflow");
-            Slots.resize(NewSize);
+        auto lock = RW_Slots.write_lock();
+        if (Slots.size() <= slot) {
+            auto new_size = (Slots.size() << 1);  // double size policy
+            assert(new_size <= SLOT_MAX && "sancheck - domain overflow");
+            Slots.resize(new_size);
         }
-
-        Lanes.beforeUnlockAllBut(H);
-        Lanes.unlockAllBut(H);
-
-        return true;
+        return std::move(lock);
     }
 };
 
