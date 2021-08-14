@@ -48,49 +48,9 @@ using GenericRecord = std::vector<RamDomain>;
 template <std::size_t Arity>
 using SpecializedRecord = std::array<RamDomain, Arity>;
 
-/// @brief A view in a sequence of RamDomain value.
-// TODO: use a `span`.
-struct GenericRecordView {
-    explicit GenericRecordView(const RamDomain* Data, const std::size_t Arity) : Data(Data), Arity(Arity) {}
-    GenericRecordView(const GenericRecordView& Other) : Data(Other.Data), Arity(Other.Arity) {}
-    GenericRecordView(GenericRecordView&& Other) : Data(Other.Data), Arity(Other.Arity) {}
-
-    const RamDomain* const Data;
-    const std::size_t Arity;
-
-    const RamDomain* data() const {
-        return Data;
-    }
-
-    const RamDomain& operator[](int I) const {
-        assert(I >= 0 && static_cast<std::size_t>(I) < Arity);
-        return Data[I];
-    }
-};
-
-template <std::size_t Arity>
-struct SpecializedRecordView {
-    explicit SpecializedRecordView(const RamDomain* Data) : Data(Data) {}
-    SpecializedRecordView(const SpecializedRecordView& Other) : Data(Other.Data) {}
-    SpecializedRecordView(SpecializedRecordView&& Other) : Data(Other.Data) {}
-
-    const RamDomain* const Data;
-
-    const RamDomain* data() const {
-        return Data;
-    }
-
-    const RamDomain& operator[](int I) const {
-        assert(I >= 0 && static_cast<std::size_t>(I) < Arity);
-        return Data[I];
-    }
-};
-
 /// @brief Hash function object for a RamDomain record.
 struct GenericRecordHash {
     explicit GenericRecordHash(const std::size_t Arity) : Arity(Arity) {}
-    GenericRecordHash(const GenericRecordHash& Other) : Arity(Other.Arity) {}
-    GenericRecordHash(GenericRecordHash&& Other) : Arity(Other.Arity) {}
 
     const std::size_t Arity;
     std::hash<RamDomain> domainHash;
@@ -107,10 +67,6 @@ struct GenericRecordHash {
 
 template <std::size_t Arity>
 struct SpecializedRecordHash {
-    explicit SpecializedRecordHash() {}
-    SpecializedRecordHash(const SpecializedRecordHash& Other) : DomainHash(Other.DomainHash) {}
-    SpecializedRecordHash(SpecializedRecordHash&& Other) : DomainHash(Other.DomainHash) {}
-
     std::hash<RamDomain> DomainHash;
 
     template <typename T>
@@ -122,23 +78,9 @@ struct SpecializedRecordHash {
     }
 };
 
-template <>
-struct SpecializedRecordHash<0> {
-    explicit SpecializedRecordHash() {}
-    SpecializedRecordHash(const SpecializedRecordHash&) {}
-    SpecializedRecordHash(SpecializedRecordHash&&) {}
-
-    template <typename T>
-    std::size_t operator()(const T&) const {
-        return 0;
-    }
-};
-
 /// @brief Equality function object for RamDomain records.
 struct GenericRecordEqual {
     explicit GenericRecordEqual(const std::size_t Arity) : Arity(Arity) {}
-    GenericRecordEqual(const GenericRecordEqual& Other) : Arity(Other.Arity) {}
-    GenericRecordEqual(GenericRecordEqual&& Other) : Arity(Other.Arity) {}
 
     const std::size_t Arity;
 
@@ -150,73 +92,16 @@ struct GenericRecordEqual {
 
 template <std::size_t Arity>
 struct SpecializedRecordEqual {
-    explicit SpecializedRecordEqual() {}
-    SpecializedRecordEqual(const SpecializedRecordEqual&) {}
-    SpecializedRecordEqual(SpecializedRecordEqual&&) {}
-
     template <typename T, typename U>
     bool operator()(const T& A, const U& B) const {
-        constexpr std::size_t Len = Arity * sizeof(RamDomain);
+        constexpr auto Len = Arity * sizeof(RamDomain);
         return (std::memcmp(A.data(), B.data(), Len) == 0);
-    }
-};
-
-template <>
-struct SpecializedRecordEqual<0> {
-    explicit SpecializedRecordEqual() {}
-    SpecializedRecordEqual(const SpecializedRecordEqual&) {}
-    SpecializedRecordEqual(SpecializedRecordEqual&&) {}
-
-    template <typename T, typename U>
-    bool operator()(const T&, const U&) const {
-        return true;
-    }
-};
-
-/// @brief Less function object for RamDomain records.
-struct GenericRecordLess {
-    explicit GenericRecordLess(const std::size_t Arity) : Arity(Arity) {}
-    GenericRecordLess(const GenericRecordLess& Other) : Arity(Other.Arity) {}
-    GenericRecordLess(GenericRecordLess&& Other) : Arity(Other.Arity) {}
-
-    const std::size_t Arity;
-
-    template <typename T, typename U>
-    bool operator()(const T& A, const U& B) const {
-        return (std::memcmp(A.data(), B.data(), Arity * sizeof(RamDomain)) < 0);
-    }
-};
-
-template <std::size_t Arity>
-struct SpecializedRecordLess {
-    explicit SpecializedRecordLess() {}
-    SpecializedRecordLess(const SpecializedRecordLess&) {}
-    SpecializedRecordLess(SpecializedRecordLess&&) {}
-
-    template <typename T, typename U>
-    bool operator()(const T& A, const U& B) const {
-        constexpr std::size_t Len = Arity * sizeof(RamDomain);
-        return (std::memcmp(A.data(), B.data(), Len) < 0);
-    }
-};
-
-template <>
-struct SpecializedRecordLess<0> {
-    explicit SpecializedRecordLess() {}
-    SpecializedRecordLess(const SpecializedRecordLess&) {}
-    SpecializedRecordLess(SpecializedRecordLess&&) {}
-
-    template <typename T, typename U>
-    bool operator()(const T&, const U&) const {
-        return false;
     }
 };
 
 /// @brief Compare function object for RamDomain records.
 struct GenericRecordCmp {
-    explicit GenericRecordCmp(const std::size_t Arity) : Arity(Arity) {}
-    GenericRecordCmp(const GenericRecordCmp& Other) : Arity(Other.Arity) {}
-    GenericRecordCmp(GenericRecordCmp&& Other) : Arity(Other.Arity) {}
+    explicit GenericRecordCmp(std::size_t Arity) : Arity(Arity) {}
 
     const std::size_t Arity;
 
@@ -228,26 +113,10 @@ struct GenericRecordCmp {
 
 template <std::size_t Arity>
 struct SpecializedRecordCmp {
-    explicit SpecializedRecordCmp() {}
-    SpecializedRecordCmp(const SpecializedRecordCmp&) {}
-    SpecializedRecordCmp(SpecializedRecordCmp&&) {}
-
     template <typename T, typename U>
     bool operator()(const T& A, const U& B) const {
         constexpr std::size_t Len = Arity * sizeof(RamDomain);
-        return std::memcmp(A.data(), B.data(), Len);
-    }
-};
-
-template <>
-struct SpecializedRecordCmp<0> {
-    explicit SpecializedRecordCmp() {}
-    SpecializedRecordCmp(const SpecializedRecordCmp&) {}
-    SpecializedRecordCmp(SpecializedRecordCmp&&) {}
-
-    template <typename T, typename U>
-    bool operator()(const T&, const U&) const {
-        return 0;
+        return std::memcmp(A.data(), B.data(), Len) < 0;
     }
 };
 
@@ -258,26 +127,23 @@ struct GenericRecordFactory {
     using reference = GenericRecord&;
 
     explicit GenericRecordFactory(const std::size_t Arity) : Arity(Arity) {}
-    GenericRecordFactory(const GenericRecordFactory& Other) : Arity(Other.Arity) {}
-    GenericRecordFactory(GenericRecordFactory&& Other) : Arity(Other.Arity) {}
 
     const std::size_t Arity;
 
-    reference replace(reference Place, const std::vector<RamDomain>& V) {
+    reference replace(reference Place, std::vector<RamDomain> V) {
         assert(V.size() == Arity);
-        Place = V;
+        Place = std::move(V);
         return Place;
     }
 
-    reference replace(reference Place, const GenericRecordView& V) {
-        Place.clear();
-        Place.insert(Place.begin(), V.data(), V.data() + Arity);
-        return Place;
+    reference replace(reference Place, const span<RamDomain const>& V) {
+        assert(V.size() == Arity);
+        return replace(Place, V.data());
     }
 
     reference replace(reference Place, const RamDomain* V) {
-        Place.clear();
-        Place.insert(Place.begin(), V, V + Arity);
+        Place.resize(Arity);
+        std::copy_n(V, Arity, Place.begin());
         return Place;
     }
 };
@@ -288,48 +154,13 @@ struct SpecializedRecordFactory {
     using pointer = SpecializedRecord<Arity>*;
     using reference = SpecializedRecord<Arity>&;
 
-    explicit SpecializedRecordFactory() {}
-    SpecializedRecordFactory(const SpecializedRecordFactory&) {}
-    SpecializedRecordFactory(SpecializedRecordFactory&&) {}
-
-    reference replace(reference Place, const SpecializedRecord<Arity>& V) {
-        assert(V.size() == Arity);
-        Place = V;
-        return Place;
-    }
-
-    reference replace(reference Place, const SpecializedRecordView<Arity>& V) {
-        constexpr std::size_t Len = Arity * sizeof(RamDomain);
-        std::memcpy(Place.data(), V.data(), Len);
-        return Place;
+    reference replace(reference Place, const span<RamDomain const, Arity>& V) {
+        return replace(Place, V.data());
     }
 
     reference replace(reference Place, const RamDomain* V) {
         constexpr std::size_t Len = Arity * sizeof(RamDomain);
-        std::memcpy(Place.data(), V, Len);
-        return Place;
-    }
-};
-
-template <>
-struct SpecializedRecordFactory<0> {
-    using value_type = SpecializedRecord<0>;
-    using pointer = SpecializedRecord<0>*;
-    using reference = SpecializedRecord<0>&;
-
-    explicit SpecializedRecordFactory() {}
-    SpecializedRecordFactory(const SpecializedRecordFactory&) {}
-    SpecializedRecordFactory(SpecializedRecordFactory&&) {}
-
-    reference replace(reference Place, const SpecializedRecord<0>&) {
-        return Place;
-    }
-
-    reference replace(reference Place, const SpecializedRecordView<0>&) {
-        return Place;
-    }
-
-    reference replace(reference Place, const RamDomain*) {
+        std::memmove(Place.data(), V, Len);
         return Place;
     }
 };
@@ -339,12 +170,17 @@ struct SpecializedRecordFactory<0> {
 /** @brief Interface of bidirectional mappping between records and record references. */
 class RecordMap {
 public:
-    virtual ~RecordMap() {}
+    virtual ~RecordMap() = default;
+
     virtual void setNumLanes(const std::size_t NumLanes) = 0;
-    virtual RamDomain pack(const std::vector<RamDomain>& Vector) = 0;
+    virtual size_t arity() const = 0;
+    virtual const RamDomain* unpack(RamDomain Index) const = 0;
     virtual RamDomain pack(const RamDomain* Tuple) = 0;
-    virtual RamDomain pack(const std::initializer_list<RamDomain>& List) = 0;
-    virtual const RamDomain* unpack(RamDomain index) const = 0;
+
+    virtual RamDomain pack(span<RamDomain const> Tuple) {
+        assert(arity() == Tuple.size());
+        return pack(Tuple.data());
+    }
 };
 
 /** @brief Bidirectional mappping between records and record references, for any record arity. */
@@ -362,27 +198,19 @@ public:
                       details::GenericRecordFactory(arity)),
               Arity(arity) {}
 
-    virtual ~GenericRecordMap() {}
-
     void setNumLanes(const std::size_t NumLanes) override {
         Base::setNumLanes(NumLanes);
     }
 
-    /** @brief converts record to a record reference */
-    RamDomain pack(const std::vector<RamDomain>& Vector) override {
-        return findOrInsert(Vector).first;
-    };
+    size_t arity() const override {
+        return Arity;
+    }
+
+    using RecordMap::pack;
 
     /** @brief converts record to a record reference */
     RamDomain pack(const RamDomain* Tuple) override {
-        details::GenericRecordView View{Tuple, Arity};
-        return findOrInsert(View).first;
-    }
-
-    /** @brief converts record to a record reference */
-    RamDomain pack(const std::initializer_list<RamDomain>& List) override {
-        details::GenericRecordView View{std::data(List), Arity};
-        return findOrInsert(View).first;
+        return findOrInsert(span<RamDomain const>{Tuple, Tuple + Arity}).first;
     }
 
     /** @brief convert record reference to a record pointer */
@@ -398,7 +226,7 @@ class SpecializedRecordMap
           protected FlyweightImpl<details::SpecializedRecord<Arity>, details::SpecializedRecordHash<Arity>,
                   details::SpecializedRecordEqual<Arity>, details::SpecializedRecordFactory<Arity>> {
     using Record = details::SpecializedRecord<Arity>;
-    using RecordView = details::SpecializedRecordView<Arity>;
+    using RecordView = span<RamDomain const, Arity>;
     using RecordHash = details::SpecializedRecordHash<Arity>;
     using RecordEqual = details::SpecializedRecordEqual<Arity>;
     using RecordFactory = details::SpecializedRecordFactory<Arity>;
@@ -408,30 +236,23 @@ public:
     SpecializedRecordMap(const std::size_t LaneCount)
             : Base(LaneCount, 8, true, RecordHash(), RecordEqual(), RecordFactory()) {}
 
-    virtual ~SpecializedRecordMap() {}
-
     void setNumLanes(const std::size_t NumLanes) override {
         Base::setNumLanes(NumLanes);
     }
 
-    /** @brief converts record to a record reference */
-    RamDomain pack(const std::vector<RamDomain>& Vector) override {
-        assert(Vector.size() == Arity);
-        RecordView View{Vector.data()};
-        return Base::findOrInsert(View).first;
-    };
+    size_t arity() const override {
+        return Arity;
+    }
 
-    /** @brief converts record to a record reference */
-    RamDomain pack(const RamDomain* Tuple) override {
-        RecordView View{Tuple};
-        return Base::findOrInsert(View).first;
+    using RecordMap::pack;
+
+    RamDomain pack(const RecordView& Tuple) {
+        return Base::findOrInsert(Tuple).first;
     }
 
     /** @brief converts record to a record reference */
-    RamDomain pack(const std::initializer_list<RamDomain>& List) override {
-        assert(List.size() == Arity);
-        RecordView View{std::data(List)};
-        return Base::findOrInsert(View).first;
+    RamDomain pack(const RamDomain* Tuple) override {
+        return Base::findOrInsert(RecordView{Tuple, Tuple + Arity}).first;
     }
 
     /** @brief convert record reference to a record pointer */
@@ -454,24 +275,20 @@ class SpecializedRecordMap<0> : public RecordMap {
 public:
     SpecializedRecordMap(const std::size_t /* LaneCount */) {}
 
-    virtual ~SpecializedRecordMap() {}
-
     void setNumLanes(const std::size_t) override {}
 
-    /** @brief converts record to a record reference */
-    RamDomain pack(const std::vector<RamDomain>& Vector) override {
-        assert(Vector.size() == 0);
-        return EmptyRecordIndex;
-    };
+    size_t arity() const override {
+        return 0;
+    }
 
-    /** @brief converts record to a record reference */
-    RamDomain pack(const RamDomain*) override {
-        return EmptyRecordIndex;
+    using RecordMap::pack;
+
+    RamDomain pack(span<RamDomain const, 0>) {
+        return pack(EmptyRecordData);
     }
 
     /** @brief converts record to a record reference */
-    RamDomain pack(const std::initializer_list<RamDomain>& List) override {
-        assert(List.size() == 0);
+    RamDomain pack(const RamDomain*) override {
         return EmptyRecordIndex;
     }
 
@@ -485,7 +302,7 @@ public:
 /** The interface of any Record Table. */
 class RecordTableInterface {
 public:
-    virtual ~RecordTableInterface() {}
+    virtual ~RecordTableInterface() = default;
 
     virtual void setNumLanes(const std::size_t NumLanes) = 0;
 
