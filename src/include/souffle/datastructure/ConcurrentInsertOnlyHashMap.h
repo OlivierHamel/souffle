@@ -77,7 +77,7 @@ struct Factory {
  * single lane perform the growing operation. The global lock is amortized
  * thanks to an exponential growth strategy.
  */
-template <class LanesPolicy, class Key, class T, class Hash = std::hash<Key>,
+template <template <typename> class LanesPolicy, class Key, class T, class Hash = std::hash<Key>,
         class KeyEqual = std::equal_to<Key>, class KeyFactory = details::Factory<Key>>
 class ConcurrentInsertOnlyHashMap {
 public:
@@ -90,8 +90,8 @@ public:
     using size_type = std::size_t;
     using hasher = Hash;
     using key_equal = KeyEqual;
-    using self_type = ConcurrentInsertOnlyHashMap<Key, T, Hash, KeyEqual, KeyFactory>;
-    using lane_id = typename LanesPolicy::lane_id;
+    using self_type = ConcurrentInsertOnlyHashMap<LanesPolicy, Key, T, Hash, KeyEqual, KeyFactory>;
+    using lane_id = typename LanesPolicy<void>::lane_id;
 
     class Node {
     public:
@@ -366,7 +366,7 @@ public:
 
 private:
     // The concurrent lanes manager.
-    LanesPolicy Lanes;
+    LanesPolicy<void> Lanes;
 
     /// Hash function.
     Hash Hasher;

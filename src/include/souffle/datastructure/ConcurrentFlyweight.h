@@ -28,11 +28,11 @@ namespace souffle {
  * thanks to an exponential growth strategy.
  *
  */
-template <class LanesPolicy, class Key, class Hash = std::hash<Key>, class KeyEqual = std::equal_to<Key>,
-        class KeyFactory = details::Factory<Key>>
+template <template <typename> class LanesPolicy, class Key, class Hash = std::hash<Key>,
+        class KeyEqual = std::equal_to<Key>, class KeyFactory = details::Factory<Key>>
 class ConcurrentFlyweight {
 public:
-    using lane_id = typename LanesPolicy::lane_id;
+    using lane_id = typename LanesPolicy<void>::lane_id;
     using index_type = std::size_t;
     using key_type = Key;
     using value_type = std::pair<const Key, const index_type>;
@@ -330,7 +330,7 @@ private:
 
 protected:
     // The concurrency manager.
-    LanesPolicy Lanes;
+    LanesPolicy<void> Lanes;
 
 private:
     // Number of handles
