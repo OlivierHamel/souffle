@@ -106,20 +106,6 @@ private:
             assert(!Next && "internal invariants violated");
         }
 
-        BucketList(const Key& K, const T& V, BucketList* N) : Value(K, V), Next(N) {}
-
-        const value_type& value() const {
-            return Value;
-        }
-
-        const key_type& key() const {
-            return Value.first;
-        }
-
-        const mapped_type& mapped() const {
-            return Value.second;
-        }
-
         // Stores the couple of a key and its associated value.
         value_type Value;
 
@@ -127,10 +113,12 @@ private:
         BucketList* Next;
     };
 
+    using BucketVector = std::vector<std::atomic<BucketList*>>;
+
     template <typename F>
     void foreachEntry(F&& go) {
-        for (size_t I = 0; I < BucketCount; ++I) {
-            auto* L = Buckets[I].load(std::memory_order_relaxed);
+        for (auto& B : Buckets) {
+            auto* L = B.load(std::memory_order_relaxed);
             while (L) {
                 auto* E = L;
                 L = L->Next;
@@ -152,14 +140,9 @@ public:
             : Lanes(LaneCount), Hasher(std::move(hash)), EqualTo(std::move(key_equal)),
               Factory(std::move(key_factory)) {
         Size = 0;
-        BucketCount = details::GreaterOrEqualPrime(Bucket_Count);
-        if (BucketCount == 0) {
-            // Hopefuly this number of buckets is never reached.
-            BucketCount = std::numeric_limits<std::size_t>::max();
-        }
-        LoadFactor = 1.0;
-        Buckets = std::make_unique<std::atomic<BucketList*>[]>(BucketCount);
-        MaxSizeBeforeGrow = std::ceil(LoadFactor * BucketCount);
+        LoadFactor = 1.0;  //< TODO: has this been tune?
+        Buckets = BucketVector(primeBucketSizing(Bucket_Count));
+        MaxSizeBeforeGrow = std::ceil(LoadFactor * Buckets.size());
     }
 
     ConcurrentInsertOnlyHashMap(Hash hash = {}, KeyEqual key_equal = {}, KeyFactory key_factory = {})
@@ -196,7 +179,7 @@ public:
     bool weakContains(const lane_id H, const K& X) const {
         const size_t HashValue = Hasher(X);
         const auto Guard = Lanes.guard(H);
-        const size_t Bucket = HashValue % BucketCount;
+        const size_t Bucket = HashValue % Buckets.size();
 
         BucketList* L = Buckets[Bucket].load(std::memory_order_consume);
         while (L != nullptr) {
@@ -309,7 +292,7 @@ public:
         Lanes.lock(H);  // prevent the datastructure from growing
 
         // 3)
-        const size_t Bucket = HashValue % BucketCount;
+        const size_t Bucket = HashValue % Buckets.size();
 
         // 4)
         // the head of the bucket's list last time we checked
@@ -387,11 +370,8 @@ private:
     /// Hash function.
     Hash Hasher;
 
-    /// Current number of buckets.
-    std::size_t BucketCount;
-
     /// Atomic pointer to head bucket linked-list head.
-    std::unique_ptr<std::atomic<BucketList*>[]> Buckets;
+    BucketVector Buckets;
 
     /// The Equal-to function.
     KeyEqual EqualTo;
@@ -429,30 +409,22 @@ private:
             const std::size_t NeededBucketCount = std::ceil(CurrentSize / LoadFactor);
             const std::size_t NewBucketCount = primeBucketSizing(NeededBucketCount);
 
-            std::unique_ptr<std::atomic<BucketList*>[]> NewBuckets =
-                    std::make_unique<std::atomic<BucketList*>[]>(NewBucketCount);
-
             // Rehash, this operation is costly because it requires to scan
             // the existing elements, compute its hash to find its new bucket
             // and insert in the new bucket.
             //
             // Maybe concurrent lanes could help using some job-stealing algorithm.
+            BucketVector NewBuckets(NewBucketCount);
             foreachEntry([&](BucketList* const E) {
                 auto&& [K, _] = E->Value;
-                auto& Bucket = NewBuckets[Hasher(K) % NewBucketCount];
+                auto& Bucket = NewBuckets[Hasher(K) % NewBuckets.size()];
 
                 E->Next = Bucket.load(std::memory_order_relaxed);
                 Bucket.store(E, std::memory_order_relaxed);
             });
 
             Buckets = std::move(NewBuckets);
-            BucketCount = NewBucketCount;
-            MaxSizeBeforeGrow = (NewBucketCount * LoadFactor);
-        }
-
-        Lanes.beforeUnlockAllBut(H);
-        Lanes.unlockAllBut(H);
-        return true;
+            MaxSizeBeforeGrow = std::ceil(Buckets.size() * LoadFactor);
     }
 };
 
