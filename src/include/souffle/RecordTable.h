@@ -20,6 +20,7 @@
 #include "souffle/RamTypes.h"
 #include "souffle/datastructure/ConcurrentFlyweight.h"
 #include "souffle/utility/span.h"
+#include <algorithm>
 #include <cassert>
 #include <cstddef>
 #include <limits>
@@ -496,107 +497,66 @@ public:
 /** A concurrent Record Table with some specialized record maps. */
 template <std::size_t... SpecializedArities>
 class SpecializedRecordTable : public RecordTableInterface {
-private:
-    // The current size of the Maps vector.
-    std::size_t Size;
-
-    // The record maps, indexed by arity.
-    std::vector<RecordMap*> Maps;
-
-    // The concurrency manager.
-    mutable ConcurrentLanes Lanes;
-
-    template <std::size_t Arity, std::size_t... Arities>
-    void CreateSpecializedMaps() {
-        if (Arity >= Size) {
-            Size = Arity + 1;
-            Maps.reserve(Size);
-            Maps.resize(Size);
-        }
-        Maps[Arity] = new SpecializedRecordMap<Arity>(Lanes.lanes());
-        if constexpr (sizeof...(Arities) > 0) {
-            CreateSpecializedMaps<Arities...>();
-        }
-    }
+    // Resizing for a new arity / changing lane count should be extremely rare.
+    // Most cases we're just doing read-only (from the arity dispatcher's POV).
+    mutable ReadWriteLock rw_maps;
+    size_t lanes;
+    std::vector<std::unique_ptr<RecordMap>> maps{std::max<size_t>({0, (SpecializedArities + 1)...})};
 
 public:
     /** @brief Construct a record table with the number of concurrent access lanes. */
-    SpecializedRecordTable(const std::size_t LaneCount) : Size(0), Lanes(LaneCount) {
-        CreateSpecializedMaps<SpecializedArities...>();
-    }
-
-    SpecializedRecordTable() : SpecializedRecordTable(1) {}
-
-    virtual ~SpecializedRecordTable() {
-        for (auto Map : Maps) {
-            delete Map;
-        }
+    SpecializedRecordTable(size_t lanes = 1) : lanes(lanes) {
+        ((maps[SpecializedArities] = std::make_unique<SpecializedRecordMap<SpecializedArities>>(lanes)), ...);
     }
 
     /**
      * @brief set the number of concurrent access lanes.
      * Not thread-safe, use only when the datastructure is not being used.
      */
-    virtual void setNumLanes(const std::size_t NumLanes) override {
-        Lanes.setNumLanes(NumLanes);
-        for (auto& Map : Maps) {
-            Map->setNumLanes(NumLanes);
-        }
+    void setNumLanes(const std::size_t n) override {
+        lanes = n;
+        for (auto& m : maps)
+            m->setNumLanes(n);
     }
 
     /** @brief convert record to record reference */
-    virtual RamDomain pack(const RamDomain* Tuple, const std::size_t Arity) override {
-        auto Guard = Lanes.guard();
-        return lookupMap(Arity).pack(Tuple);
+    RamDomain pack(const RamDomain* Tuple, const std::size_t Arity) override {
+        auto&& [_, m] = lookupMap(Arity);
+        return m.pack(Tuple);
     }
 
     /** @brief convert record reference to a record */
-    virtual const RamDomain* unpack(const RamDomain Ref, const std::size_t Arity) const override {
-        auto Guard = Lanes.guard();
-        return lookupMap(Arity).unpack(Ref);
+    const RamDomain* unpack(const RamDomain Ref, const std::size_t Arity) const override {
+        auto&& [_, m] = existingMap(Arity);
+        return m.unpack(Ref);
     }
 
 private:
     /** @brief lookup RecordMap for a given arity; the map for that arity must exist. */
-    RecordMap& lookupMap(const std::size_t Arity) const {
-        assert(Arity < Size && "Lookup for an arity while there is no record for that arity.");
-        auto* Map = Maps[Arity];
-        assert(Map != nullptr && "Lookup for an arity while there is no record for that arity.");
-        return *Map;
+    std::pair<ReadWriteLock::ReadLock, RecordMap&> existingMap(size_t arity) const {
+        auto lock = rw_maps.read_lock();
+        assert(arity < maps.size() && "Lookup for an arity while there is no record for that arity.");
+        auto& m = maps[arity];
+        assert(m && "Lookup for an arity while there is no record for that arity.");
+        return {std::move(lock), *m};
     }
 
     /** @brief lookup RecordMap for a given arity; if it does not exist, create new RecordMap */
-    RecordMap& lookupMap(const std::size_t Arity) {
-        if (Arity < Size) {
-            auto* Map = Maps[Arity];
-            if (Map) {
-                return *Map;
-            }
+    std::pair<ReadWriteLock::ReadLock, RecordMap&> lookupMap(size_t arity) {
+        auto lookup = [&]() { return arity < maps.size() ? maps[arity].get() : nullptr; };
+
+        {
+            auto lock = rw_maps.read_lock();
+            if (auto* m = lookup()) return {std::move(lock), *m};
         }
 
-        createMap(Arity);
-        return *Maps[Arity];
-    }
+        auto lock = rw_maps.write_lock();
+        if (auto* m = lookup()) return {std::move(lock), *m};
 
-    /** @brief create the RecordMap for the given arity. */
-    void createMap(const std::size_t Arity) {
-        Lanes.beforeLockAllBut();
-        if (Arity < Size && Maps[Arity] != nullptr) {
-            // Map of required arity has been created concurrently
-            Lanes.beforeUnlockAllBut();
-            return;
-        }
-        Lanes.lockAllBut();
-
-        if (Arity >= Size) {
-            Size = Arity + 1;
-            Maps.reserve(Size);
-            Maps.resize(Size);
-        }
-        Maps[Arity] = new GenericRecordMap(Lanes.lanes(), Arity);
-
-        Lanes.beforeUnlockAllBut();
-        Lanes.unlockAllBut();
+        maps.resize(std::max(maps.size(), arity + 1));
+        maps[arity] = std::make_unique<GenericRecordMap>(lanes, arity);
+        auto& m = maps[arity];
+        return {std::move(lock), *m};
     }
 };
 
