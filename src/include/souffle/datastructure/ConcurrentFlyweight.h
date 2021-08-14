@@ -14,6 +14,8 @@
 #include <cstring>
 #include <limits>
 #include <type_traits>
+#include <utility>
+#include <vector>
 
 namespace souffle {
 
@@ -150,9 +152,9 @@ public:
         void FindNextMaybeUnassignedSlot() {
             NextMaybeUnassignedSlot = END;
             for (lane_id I = 0; I < This->Lanes.lanes(); ++I) {
-                const auto Lane = This->Lanes.guard(I);
-                if (This->Handles[I].NextSlot > Slot && This->Handles[I].NextSlot < NextMaybeUnassignedSlot) {
-                    NextMaybeUnassignedSlot = This->Handles[I].NextSlot;
+                auto&& [_, Handle] = This->Lanes.guard(I);
+                if (Slot < Handle.NextSlot && Handle.NextSlot < NextMaybeUnassignedSlot) {
+                    NextMaybeUnassignedSlot = Handle.NextSlot;
                     NextMaybeUnassignedHandle = I;
                 }
             }
@@ -181,9 +183,11 @@ public:
                 }
 
                 if (NextMaybeUnassignedHandle != NONE) {  // maybe reaching the next unassigned slot
-                    This->Lanes.lock(NextMaybeUnassignedHandle);
-                    const bool IsAssigned = (Slot + 1 < This->Handles[NextMaybeUnassignedHandle].NextSlot);
-                    This->Lanes.unlock(NextMaybeUnassignedHandle);
+                    bool IsAssigned;
+                    {
+                        auto&& [_, Handle] = This->Lanes.guard(NextMaybeUnassignedHandle);
+                        IsAssigned = Slot + 1 < Handle.NextSlot;
+                    }
 
                     if (IsAssigned) {
                         Slot = Slot + 1;
@@ -207,23 +211,15 @@ public:
             Hash hash = {}, KeyEqual key_equal = {}, KeyFactory key_factory = {})
             : Lanes(LaneCount), Mapping(LaneCount, InitialCapacity, std::move(hash), std::move(key_equal),
                                         std::move(key_factory)) {
-        Slots = std::make_unique<const value_type*[]>(InitialCapacity);
-        Handles = std::make_unique<Handle[]>(HandleCount);
+        Slots.resize(InitialCapacity);
         NextSlot = (ReserveFirst ? 1 : 0);
-        MaxSlotBeforeGrow = InitialCapacity - 1;
     }
 
     /**
-     * Change the number of lanes and possibly grow the number of handles.
+     * Change the number of lanes.
      * Do not use while threads are using this datastructure.
      */
     void setNumLanes(const std::size_t NumLanes) {
-        if (NumLanes > HandleCount) {
-            std::unique_ptr<Handle[]> NextHandles = std::make_unique<Handle[]>(NumLanes);
-            std::copy(Handles.get(), Handles.get() + HandleCount, NextHandles.get());
-            Handles.swap(NextHandles);
-            HandleCount = NumLanes;
-        }
         Mapping.setNumLanes(NumLanes);
         Lanes.setNumLanes(NumLanes);
     }
@@ -257,37 +253,30 @@ public:
     /// yet indexed.
     template <class... Args>
     std::pair<index_type, bool> findOrInsert(const lane_id H, Args&&... Xs) {
-        const auto Lane = Lanes.guard(H);
-        int64_t Slot = Handles[H].NextSlot;
-        node_type Node;
+        auto&& [_, Handle] = Lanes.guard(H);
+        auto [Slot, Node] = std::move(Handle);
+        Handle = {};  // clear/reset (move doesn't necessarily change primitive values)
 
         if (Slot == NONE) {
             // reserve a slot in the index, be it for now or later usage.
             Slot = NextSlot++;
-            Node = Mapping.node(static_cast<index_type>(Slot));
+            Node = Mapping.node(index(Slot));
 
-            Handles[H].NextSlot = Slot;
-            Handles[H].NextNode = Node;
-
-            if (Slot > MaxSlotBeforeGrow) {
+            if (Slots.size() <= Slot) {
                 tryGrow(H);
             }
-        } else {
-            Node = Handles[H].NextNode;
+
+            // insert key in the index in advance
+            Slots[Slot] = &Node->Value;
         }
 
-        // insert key in the index in advance
-        Slots[Slot] = &Node->value();
+        auto [kv, inserted] = Mapping.get(H, Node, std::forward<Args>(Xs)...);
+        if (inserted) return {index(Slot), true};
 
-        auto Res = Mapping.get(H, Node, std::forward<Args>(Xs)...);
-        if (Res.second) {
-            // inserted by self
-            Handles[H] = {};
-            return std::make_pair(static_cast<index_type>(Slot), true);
-        } else {
-            // inserted concurrently by another handle,
-            return std::make_pair(Res.first->second, false);
-        }
+        // Key inserted concurrently by a different handle.
+        // Keep the allocated handle for a future insertion.
+        Handle = {Slot, Node};
+        return {kv->second, false};
     }
 
 private:
@@ -304,31 +293,23 @@ private:
 
 protected:
     // The concurrency manager.
-    LanesPolicy<void> Lanes;
+    LanesPolicy<Handle> Lanes;
 
 private:
-    // Number of handles
-    std::size_t HandleCount;
-
-    // Handle for each concurrent lane.
-    std::unique_ptr<Handle[]> Handles;
-
     // Slots[I] points to the value associated with index I.
-    std::unique_ptr<const value_type*[]> Slots;
+    // TODO: Is thread contention an issue?
+    std::vector<value_type const*> Slots;
 
     // The map from keys to index.
     map_type Mapping;
 
     // Next available slot.
-    std::atomic<std::int64_t> NextSlot;
-
-    // Maximum allowed slot index before growing
-    std::int64_t MaxSlotBeforeGrow;
+    std::atomic<slot_type> NextSlot;
 
     bool tryGrow(const lane_id H) {
         Lanes.beforeLockAllBut(H);
 
-        if (NextSlot <= MaxSlotBeforeGrow) {
+        if (NextSlot < Slots.size()) {
             // Current size is fine
             Lanes.beforeUnlockAllBut(H);
             return false;
@@ -337,13 +318,10 @@ private:
         Lanes.lockAllBut(H);
 
         {  // safe section
-            const std::size_t CurrentSize = MaxSlotBeforeGrow + 1;
+            const std::size_t CurrentSize = Slots.size();
             const std::size_t NewSize = (CurrentSize << 1);  // double size policy
-            std::unique_ptr<const value_type*[]> NewSlots = std::make_unique<const value_type*[]>(NewSize);
-            std::memcpy(NewSlots.get(), Slots.get(), sizeof(const value_type*) * CurrentSize);
-            Slots = std::move(NewSlots);
             assert(NewSize <= SLOT_MAX && "sancheck - domain overflow");
-            MaxSlotBeforeGrow = NewSize - 1;
+            Slots.resize(NewSize);
         }
 
         Lanes.beforeUnlockAllBut(H);
