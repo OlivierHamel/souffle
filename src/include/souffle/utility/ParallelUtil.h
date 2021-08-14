@@ -117,6 +117,74 @@ constexpr std::size_t hardware_destructive_interference_size = 2 * sizeof(max_al
 
 namespace souffle {
 
+namespace detail {
+template <typename Impl>
+struct ReadWriteLockBase {
+    struct ReadLock;
+    struct WriteLock {
+        WriteLock(Impl& rw) : rw(&rw) {
+            rw.start_write();
+        }
+
+        ~WriteLock() {
+            if (rw) rw->end_write();
+        }
+
+        WriteLock(WriteLock const&) = delete;
+        WriteLock(WriteLock&& rhs) {
+            std::swap(rw, rhs.rw);
+        }
+
+        WriteLock& operator=(WriteLock rhs) {
+            std::swap(rw, rhs.rw);
+            return *this;
+        }
+
+        friend struct ReadLock;
+
+    private:
+        Impl* rw = {};
+    };
+
+    struct ReadLock {
+        ReadLock() = default;
+        ReadLock(Impl& rw) : rw(&rw) {
+            rw.start_read();
+        }
+
+        ReadLock(WriteLock lock) {
+            std::swap(rw, lock.rw);
+            if (rw) rw->downgrade_to_read();
+        }
+
+        ~ReadLock() {
+            if (rw) rw->end_read();
+        }
+
+        ReadLock(ReadLock const&) = delete;
+        ReadLock(ReadLock&& rhs) {
+            std::swap(rw, rhs.rw);
+        }
+
+        ReadLock& operator=(ReadLock rhs) {
+            std::swap(rw, rhs.rw);
+            return *this;
+        }
+
+    private:
+        Impl* rw = {};
+    };
+
+    ReadLock read_lock() {
+        return ReadLock{static_cast<Impl&>(*this)};
+    }
+
+    WriteLock write_lock() {
+        return WriteLock{static_cast<Impl&>(*this)};
+    }
+};
+}  // namespace detail
+
 struct SeqConcurrentLanes {
     struct TrivialLock {
         ~TrivialLock() {}
@@ -276,7 +344,7 @@ public:
  * A read/write lock for increased access performance on a
  * read-heavy use case.
  */
-class ReadWriteLock {
+class ReadWriteLock : public detail::ReadWriteLockBase<ReadWriteLock> {
     /**
      * Based on paper:
      *         Scalable Reader-Writer Synchronization
@@ -741,7 +809,7 @@ public:
     void unlock() {}
 };
 
-class ReadWriteLock {
+class ReadWriteLock : public detail::ReadWriteLockBase<ReadWriteLock> {
 public:
     ReadWriteLock() = default;
 
