@@ -271,11 +271,12 @@ public:
         }
 
         auto [kv, inserted] = Mapping.get(H, Node, std::forward<Args>(Xs)...);
+        assert(inserted == !Node && "should be null iff inserted");
         if (inserted) return {index(Slot), true};
 
         // Key inserted concurrently by a different handle.
         // Keep the allocated handle for a future insertion.
-        Handle = {Slot, Node};
+        Handle = {Slot, std::move(Node)};
         return {kv->second, false};
     }
 

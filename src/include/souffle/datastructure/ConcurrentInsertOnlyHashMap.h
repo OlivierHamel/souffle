@@ -20,7 +20,7 @@
 namespace souffle {
 namespace details {
 
-static const std::vector<std::pair<unsigned, unsigned>> ToPrime = {
+constexpr std::pair<unsigned, unsigned> ToPrime[] = {
         // https://primes.utm.edu/lists/2small/0bit.html
         // ((2^n) - k) is prime
         // {n, k}
@@ -34,19 +34,17 @@ static const std::vector<std::pair<unsigned, unsigned>> ToPrime = {
         {60, 93}, {61, 1}, {62, 57}, {63, 25}};
 
 // (2^64)-59 is the largest prime that fits in uint64_t
-static constexpr uint64_t LargestPrime64 = 18446744073709551557UL;
+constexpr uint64_t LargestPrime64 = 18446744073709551557UL;
 
 // Return a prime greater or equal to the lower bound.
 // Return 0 if the next prime would not fit in 64 bits.
-static uint64_t GreaterOrEqualPrime(const uint64_t LowerBound) {
+inline uint64_t GreaterOrEqualPrime(const uint64_t LowerBound) {
     if (LowerBound > LargestPrime64) {
         return 0;
     }
 
-    for (std::size_t I = 0; I < ToPrime.size(); ++I) {
-        const uint64_t N = ToPrime[I].first;
-        const uint64_t K = ToPrime[I].second;
-        const uint64_t Prime = (1UL << N) - K;
+    for (auto&& [N, K] : ToPrime) {
+        const uint64_t Prime = (1UL << uint64_t(N)) - K;
         if (Prime >= LowerBound) {
             return Prime;
         }
@@ -80,12 +78,17 @@ struct Factory {
 template <template <typename> class LanesPolicy, class Key, class T, class Hash = std::hash<Key>,
         class KeyEqual = std::equal_to<Key>, class KeyFactory = details::Factory<Key>>
 class ConcurrentInsertOnlyHashMap {
-public:
-    class Node;
+    static size_t primeBucketSizing(size_t n_required) {
+        auto n = details::GreaterOrEqualPrime(n_required);
+        // Assert never expected to trigger. If we need more than `LargestPrime64` buckets we
+        // couldn't allocate it in a 64 bit addr space b/c a bucket requires > 1 byte.
+        assert(n != 0 && "absurd # of buckets required");
+        return n;
+    }
 
+public:
     using key_type = Key;
     using mapped_type = T;
-    using node_type = Node*;
     using value_type = std::pair<const Key, const T>;
     using size_type = std::size_t;
     using hasher = Hash;
@@ -93,18 +96,15 @@ public:
     using self_type = ConcurrentInsertOnlyHashMap<LanesPolicy, Key, T, Hash, KeyEqual, KeyFactory>;
     using lane_id = typename LanesPolicy<void>::lane_id;
 
-    class Node {
-    public:
-        virtual ~Node() {}
-        virtual const value_type& value() const = 0;
-        virtual const key_type& key() const = 0;
-        virtual const mapped_type& mapped() const = 0;
-    };
-
 private:
     // Each bucket of the hash-map is a linked list.
-    struct BucketList : Node {
-        virtual ~BucketList() {}
+    struct BucketList {
+        ~BucketList() {
+            // If this triggers either:
+            // a) Client code mutated data structure internal state. (Their problem.)
+            // b) The cleanup code should have acquired and released this node.
+            assert(!Next && "internal invariants violated");
+        }
 
         BucketList(const Key& K, const T& V, BucketList* N) : Value(K, V), Next(N) {}
 
@@ -127,16 +127,30 @@ private:
         BucketList* Next;
     };
 
+    template <typename F>
+    void foreachEntry(F&& go) {
+        for (size_t I = 0; I < BucketCount; ++I) {
+            auto* L = Buckets[I].load(std::memory_order_relaxed);
+            while (L) {
+                auto* E = L;
+                L = L->Next;
+                go(E);
+            }
+        }
+    }
+
 public:
+    using node_type = std::unique_ptr<BucketList>;
+
     /**
      * @brief Construct a hash-map with at least the given number of buckets.
      *
      * Load-factor is initialized to 1.0.
      */
-    ConcurrentInsertOnlyHashMap(const std::size_t LaneCount, const std::size_t Bucket_Count,
-            const Hash& hash = Hash(), const KeyEqual& key_equal = KeyEqual(),
-            const KeyFactory& key_factory = KeyFactory())
-            : Lanes(LaneCount), Hasher(hash), EqualTo(key_equal), Factory(key_factory) {
+    ConcurrentInsertOnlyHashMap(const std::size_t LaneCount, const std::size_t Bucket_Count, Hash hash = {},
+            KeyEqual key_equal = {}, KeyFactory key_factory = {})
+            : Lanes(LaneCount), Hasher(std::move(hash)), EqualTo(std::move(key_equal)),
+              Factory(std::move(key_factory)) {
         Size = 0;
         BucketCount = details::GreaterOrEqualPrime(Bucket_Count);
         if (BucketCount == 0) {
@@ -148,19 +162,14 @@ public:
         MaxSizeBeforeGrow = std::ceil(LoadFactor * BucketCount);
     }
 
-    ConcurrentInsertOnlyHashMap(const Hash& hash = Hash(), const KeyEqual& key_equal = KeyEqual(),
-            const KeyFactory& key_factory = KeyFactory())
-            : ConcurrentInsertOnlyHashMap(8, hash, key_equal, key_factory) {}
+    ConcurrentInsertOnlyHashMap(Hash hash = {}, KeyEqual key_equal = {}, KeyFactory key_factory = {})
+            : ConcurrentInsertOnlyHashMap(8, std::move(hash), std::move(key_equal), std::move(key_factory)) {}
 
     ~ConcurrentInsertOnlyHashMap() {
-        for (std::size_t Bucket = 0; Bucket < BucketCount; ++Bucket) {
-            BucketList* L = Buckets[Bucket].load(std::memory_order_relaxed);
-            while (L != nullptr) {
-                BucketList* BL = L;
-                L = L->Next;
-                delete (BL);
-            }
-        }
+        foreachEntry([](auto* BL) {
+            BL->Next = nullptr;
+            delete BL;
+        });
     }
 
     void setNumLanes(const std::size_t NumLanes) {
@@ -173,8 +182,7 @@ public:
      * The ownership of the returned node given to the caller.
      */
     node_type node(const T& V) {
-        BucketList* BL = new BucketList(Key{}, V, nullptr);
-        return static_cast<node_type>(BL);
+        return {std::make_unique<BucketList>(BucketList{{Key{}, V}, nullptr})};
     }
 
     /** @brief Checks if the map contains an element with the given key.
@@ -239,7 +247,10 @@ public:
      *
      */
     template <class... Args>
-    std::pair<const value_type*, bool> get(const lane_id H, node_type N, Args&&... Xs) {
+    std::pair<const value_type*, bool> get(const lane_id H, node_type& Node, Args&&... Xs) {
+        assert(Node && "invalid handle");
+        assert(!Node->Next && "node is already part of a chain");
+
         // At any time a concurrent lane may insert the key before this lane.
         //
         // The synchronisation point is the atomic compare-and-exchange of the
@@ -305,8 +316,6 @@ public:
         BucketList* LastKnownHead = Buckets[Bucket].load(std::memory_order_relaxed);
         // the head of the bucket's list we already searched from
         BucketList* SearchedFrom = nullptr;
-        // the node we want to insert
-        BucketList* Node = static_cast<BucketList*>(N);
 
         // Loop until either the node is inserted or the key is found in the bucket.
         // Assuming bucket collisions are rare this loop is not executed more than once.
@@ -338,12 +347,12 @@ public:
             // This operation also performs step 4) because LastKnownHead is
             // updated in the process.
             if (Buckets[Bucket].compare_exchange_strong(
-                        LastKnownHead, Node, std::memory_order_release, std::memory_order_relaxed)) {
+                        LastKnownHead, Node.get(), std::memory_order_release, std::memory_order_relaxed)) {
                 // 9)
                 Inserted = true;
                 NewSize = ++Size;
                 Value = &(Node->Value);
-                Node = nullptr;
+                Node.release();
                 goto AfterInserted;
             }
 
@@ -358,7 +367,14 @@ public:
 
     Done:
 
+        // do the assert before releasing the lock to avoid debugger/thread races
+        assert(Inserted == !Node);
+
         Lanes.unlock(H);
+
+        if (!Inserted) {
+            Node->Next = nullptr;  // drop any refs to the chain that may have been collected
+        }
 
         // 6,9)
         return std::make_pair(Value, Inserted);
@@ -411,16 +427,7 @@ private:
             // given the current number of elements in the map.
             const std::size_t CurrentSize = Size;
             const std::size_t NeededBucketCount = std::ceil(CurrentSize / LoadFactor);
-            std::size_t NewBucketCount = NeededBucketCount;
-            for (std::size_t I = 0; I < details::ToPrime.size(); ++I) {
-                const uint64_t N = details::ToPrime[I].first;
-                const uint64_t K = details::ToPrime[I].second;
-                const uint64_t Prime = (1UL << N) - K;
-                if (Prime >= NeededBucketCount) {
-                    NewBucketCount = Prime;
-                    break;
-                }
-            }
+            const std::size_t NewBucketCount = primeBucketSizing(NeededBucketCount);
 
             std::unique_ptr<std::atomic<BucketList*>[]> NewBuckets =
                     std::make_unique<std::atomic<BucketList*>[]>(NewBucketCount);
@@ -430,19 +437,13 @@ private:
             // and insert in the new bucket.
             //
             // Maybe concurrent lanes could help using some job-stealing algorithm.
-            for (std::size_t B = 0; B < BucketCount; ++B) {
-                BucketList* L = Buckets[B].load(std::memory_order_relaxed);
-                while (L) {
-                    BucketList* const Elem = L;
-                    L = L->Next;
+            foreachEntry([&](BucketList* const E) {
+                auto&& [K, _] = E->Value;
+                auto& Bucket = NewBuckets[Hasher(K) % NewBucketCount];
 
-                    const auto& Value = Elem->Value;
-                    std::size_t NewHash = Hasher(Value.first);
-                    const std::size_t NewBucket = NewHash % NewBucketCount;
-                    Elem->Next = NewBuckets[NewBucket].load(std::memory_order_relaxed);
-                    NewBuckets[NewBucket].store(Elem, std::memory_order_relaxed);
-                }
-            }
+                E->Next = Bucket.load(std::memory_order_relaxed);
+                Bucket.store(E, std::memory_order_relaxed);
+            });
 
             Buckets = std::move(NewBuckets);
             BucketCount = NewBucketCount;
